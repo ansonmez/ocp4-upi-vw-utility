@@ -1,0 +1,146 @@
+- hosts: utility
+  gather_facts: false
+  vars_files:
+  - default_vars.yaml
+  tasks:
+    - name: Create new cluster's directory
+      file:
+        path: "{{ cluster_name }}"
+        state: directory
+
+    - name: Put install-config.yaml into cluster directory
+      copy:
+        src: "{{ install_config_file }}"
+        dest: "{{ cluster_name }}/install-config.yaml"
+        remote_src: no
+
+#    - name: Put install-config.yaml into cluster directory
+#      copy:
+#        content: "{{ install_config | to_nice_yaml(indent=2) }}"
+#        dest: "{{ cluster_name }}/install-config.yaml"
+#        remote_src: no
+
+    - name: Create ignition configs of new cluster
+      command: openshift-install create ignition-configs --dir={{ cluster_name }}
+
+    - name: Adding httpd server into Ansible's run-time inventory
+      add_host:
+        name: httpd
+        groups: httpservers
+        ansible_host: "{{ httpd_ip }}"
+        ansible_user: root
+
+
+- name: Check HTTP server
+  hosts: utility
+  gather_facts: no
+  vars_files:
+  - default_vars.yaml
+  vars:
+    bootstrap_ign_file: "{{ cluster_name }}/bootstrap.ign"
+    http_document_root: /var/www/html/ignitions
+    bootstrap_ignition_config_url: "http://{{ httpd_ip }}:{{ webport }}/ignitions/{{cluster_name}}_bootstrap.ign"
+  tasks: 
+  - name : install httpd
+    yum:
+      name: httpd
+      state: 'present'
+      update_cache: 'yes'
+  - name: Create dir 
+    file:
+      path: /var/www/html/ignitions
+      state:  directory
+      mode: 0775
+  - name: restart httpd
+    service:
+      name: httpd
+      state: restarted
+      enabled: yes
+     
+
+  - name: Copy bootstrap ignition file to http server
+    copy:
+      src: "{{ bootstrap_ign_file }}"
+      dest: "{{ http_document_root }}/{{cluster_name}}_bootstrap.ign"
+      remote_src: yes
+  
+  - name: Check that http server is serving bootstrap ignition file
+    uri:
+      url: "{{ bootstrap_ignition_config_url }}"
+      return_content: no
+      status_code: 200
+
+  - name: rsync cluster files
+    synchronize: src={{ cluster_name }}/ dest={{ cluster_name }} mode=pull
+
+- hosts: localhost
+  gather_facts: false
+  vars_files:
+  - default_vars.yaml
+  vars:
+    master_ign_file: "{{ cluster_name }}/master.ign"
+    worker_ign_file: "{{ cluster_name }}/worker.ign"
+    bootstrap_ign_file: "{{ cluster_name }}/bootstrap.ign"
+    kubeconfig: "{{ cluster_name }}/auth/kubeconfig"
+    bootstrap_ignition_config_url: "http://{{ httpd_ip }}:{{ webport }}/ignitions/{{cluster_name}}_bootstrap.ign"
+  tasks:
+    - set_fact:
+        master_ip_addresses: "{{ ocp_master_ips.split(',') }}"
+        worker_ip_addresses: "{{ ocp_worker_ips.split(',') }}"
+        bootstrap_ip_addresses: "{{ ocp_bootstrap_ip.split(',') }}"
+
+    - name: Create a VM folder on vCenter for new OpenShift cluster
+      vcenter_folder:
+        hostname: "{{ vcenterhostname }}"
+        username: "{{ vcenterusername }}"
+        password: "{{ vcenterpassword }}"
+        validate_certs: no
+        datacenter: "{{ vcenterdatacenter }}"
+        validate_certs: no
+        folder_name: "{{ cluster_name }}"
+        folder_type: vm
+        state: present
+
+    - name: Set node role to bootstrap
+      set_fact:
+        node_role: bootstrap
+        ignition_template: append-bootstrap.ign
+
+    - name: Create bootstrap VM
+      include_tasks: nodes.yaml
+      with_items: "{{ bootstrap_ip_addresses }}"
+      loop_control:
+        loop_var: ip
+        index_var: idx
+
+    - name: Set node role to control-plane
+      set_fact:
+        node_role: master
+        ignition_template: node.ign
+
+    - name: Read master ignition config
+      set_fact:
+        ignition_data: "{{ lookup('file', master_ign_file) }}"
+
+    - name: Create control plane VMs
+      include_tasks: nodes.yaml
+      with_items: "{{ master_ip_addresses }}"
+      loop_control:
+        loop_var: ip
+        index_var: idx
+
+    - name: Set node role to compute
+      set_fact:
+        node_role: worker
+        ignition_template: node.ign
+
+    - name: Read worker ignition config
+      set_fact:
+        ignition_data: "{{ lookup('file', worker_ign_file) }}"
+
+    - name: Create compute VMs
+      include_tasks: nodes.yaml
+      with_items: "{{ worker_ip_addresses }}"
+      loop_control:
+        loop_var: ip
+        index_var: idx

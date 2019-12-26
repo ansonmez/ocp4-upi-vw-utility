@@ -1,0 +1,4 @@
+- import_playbook: install_network_services.yaml
+- import_playbook: upix.yaml
+- import_playbook: configure_network_services.yaml
+- import_playbook: upipost.yaml

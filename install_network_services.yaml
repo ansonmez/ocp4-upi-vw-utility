@@ -1,0 +1,189 @@
+---
+- name: Create a new VM for network services
+  hosts: localhost
+  gather_facts: true
+  vars_files:
+  - default_vars.yaml
+  vars:
+    vm_dns_domain: "{{ ocp_master_vm_dns_domain }}"
+    is_stateless: False
+    node_role: ""
+    ocp_cluster_name: "{{ cluster_name }}"
+    network_utility_vm_name: "{{ ocp_cluster_name }}-utility"
+  tasks:
+  - name: Enable Epel Repository
+    yum:
+      name: epel-release
+      state: present
+
+  - name: Ensure jq is installed
+    yum:
+      name: jq
+      state: present
+
+  - name: Ensure pypvmomi is installed
+    yum:
+      name: python-pyvmomi
+      state: present
+
+  - name: Ensure pypvmomi is installed
+    yum:
+      name: python-requests
+      state: present
+
+  - name: Create a VM folder on vCenter for new OpenShift cluster
+    vcenter_folder:
+      hostname: "{{ vcenterhostname }}"
+      username: "{{ vcenterusername }}"
+      password: "{{ vcenterpassword }}"
+      validate_certs: no
+      datacenter: "{{ vcenterdatacenter }}"
+      folder_name: "{{ cluster_name }}"
+      folder_type: vm
+      state: present
+
+
+  - name: Clone VMs
+    vmware_guest:
+      hostname: "{{ vcenterhostname }}"
+      username: "{{ vcenterusername }}"
+      password: "{{ vcenterpassword }}"
+      validate_certs: no
+      datacenter: "{{ vcenterdatacenter }}"
+      folder: "/{{ cluster_name }}"
+      name: "{{ network_utility_vm_name }}"
+      state: poweredon
+      template: "{{ network_utility_vm_template }}"
+      networks:
+        - name: "{{ network_utility_networkname }}"
+          ip: "{{ ocp_network_utility_ip }}"
+          netmask: "{{ network_utility_netmask }}"
+          domain: "{{ domain_name }}"
+          gateway: "{{network_utility_gateway }}"
+          dns_servers:  "{{ utility_dns_servers }}"
+#      customization:
+#        password: redhat
+#        runonce:
+#        - yum remove -y cloud-init 
+#        - mkdir /root/.ssh
+#        - chmod 600 /root/.ssh
+#        - cat "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDDZD1UXn5zkyEO01AERaASN7bSSNcBmaBEVhEawWkpI8ieamKumF8+QARjGOv+HJNoBpbKGlRiXazYV2Zubn2t/jgAyThTuyurt72GV6zELq2m61/3SVcxyd5wPJroyeT/wnm7dauHyRizuws9Azdfzn73QYpw4h7xOr/u9p8N2H8OnVAhYp789BiZ7oo0e8GZoz2ApTcP1nFTIN3WaLw/Dv64Jo1J83u4dioRB+GYsRqdl/aBFenoyElxK4+XUM8yR5m3Q+jt3sm5ar8e4Hp0iTrFAvH1IVuaHBTPJ3XbYOj9+S9/MFadj9VJGz1g3xnXmktnnTcyU53lWeRAcoqv root@asjump01" > /root/.ssh/authorized_keys
+#        - chmod 600 /root/.ssh/authorized_keys
+      customvalues:
+      - key: "disk.EnableUUID"
+        value: "TRUE"
+      hardware:
+        memory_mb: 16384
+        num_cpus: 4
+        num_cpu_cores_per_socket: 2
+    register: deploy
+#  - name: Login to RHV
+#    ovirt_auth:
+#      insecure: true
+#
+#  - name: Create a new VM for network services
+#    ovirt_vm:
+#      auth: "{{ ovirt_auth }}"
+#      name: "{{ network_utility_vm_name }}"
+#      cluster: "{{ cluster }}"
+#      template: "{{ network_utility_vm_template }}"
+#      memory: "{{ network_utility_vm_memory }}"
+#      cpu_cores: "{{ network_utility_vm_cpus }}"
+#      type: server
+#      state: running
+#      wait: true
+#      nics:
+#      - name: nic1
+#        profile_name: "{{ nic_profile_name }}"
+#      cloud_init_persist: yes
+#      cloud_init:
+#        nic_boot_protocol: static
+#        nic_name: eth0
+#        nic_on_boot: true
+#        nic_ip_address: "{{ ocp_network_utility_ip }}"
+#        nic_netmask: "{{ netmask }}"
+#        nic_gateway: "{{ network_utility_gateway }}"
+#        dns_servers: "{{ dns_servers }}"
+#        host_name: "{{ network_utility_vm_name }}.{{ vm_dns_domain }}"
+#        user_name: root
+#        authorized_ssh_keys: "{{ authorized_ssh_keys }}"
+#        custom_script: |
+#          runcmd:
+#            - [ yum, remove, -y, cloud-init ]
+
+  - name: Add network services VM into Ansible's run-time inventory
+    add_host:
+      hostname: "{{ network_utility_vm_name }}"
+      groups: utility
+      ansible_host: "{{ ocp_network_utility_ip }}"
+      ansible_user: root
+
+- name: Wait for utility to start
+  hosts: "{{ network_utility_vm_name }}"
+  gather_facts: false
+  vars_files:
+  - default_vars.yaml
+  vars:
+    vm_dns_domain: "{{ ocp_master_vm_dns_domain }}"
+    is_stateless: False
+    node_role: ""
+    ocp_cluster_name: "{{ cluster_name }}"
+    network_utility_vm_name: "{{ ocp_cluster_name }}-utility"
+  tasks:
+  - name: Wait for bootstrap machine to be reachable over network
+    wait_for_connection:
+      delay: 60
+      timeout: 300
+
+- name: Install Network Services
+  hosts: utility
+  gather_facts: true
+  vars_files:
+  - default_vars.yaml
+  vars:
+    vm_dns_domain: "{{ ocp_master_vm_dns_domain }}"
+    ocp_cluster_name: "{{ cluster_name }}"
+  tasks:
+  - name: configure resolve
+    lineinfile:
+      path: /etc/resolv.conf
+      
+      line: nameserver {{ utility_dns_servers }}
+      state: present
+  - name: Configure http proxy settings
+    block:
+    - name: Add http_proxy settings into .bashrc
+      lineinfile:
+        dest: "{{ ansible_user_dir }}/.bashrc"
+        line: export http_proxy={{ http_proxy }}
+        state: present
+    - lineinfile:
+        dest: "{{ ansible_user_dir }}/.bashrc"
+        line: export https_proxy={{ http_proxy }}
+        state: present
+    - lineinfile:
+        dest: "{{ ansible_user_dir }}/.bashrc"
+        line: export no_proxy=.{{ domain_name }},.{{ ocp_cluster_name }}.{{ domain_name }},{{ installer_artifacts_url | urlsplit('hostname') }},localhost,127.0.0.1
+        state: present
+    - name: Configure proxy for yum
+      ini_file:
+        path: /etc/yum.conf
+        section: main
+        option: proxy
+        value: "{{ http_proxy }}"
+        backup: yes
+    when: http_proxy is defined and http_proxy != ""
+  - name: clean cache
+    command:  yum clean all
+
+  - name: Ensure rsync is installed
+    yum:
+      name: rsync
+      state: present
+      
+  - name: configure dnsmasq
+    include_tasks: configurednsmasq.yaml
+
+  - name: install and configure httpd
+    include_tasks: install-httpd.yaml
+
